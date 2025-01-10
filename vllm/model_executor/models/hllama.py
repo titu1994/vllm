@@ -253,80 +253,19 @@ class HLlamaConfig(_LlamaConfig):
 
         # Validate layerwise configurations if provided
         if self.layerwise_swa_sizes is not None:
-            assert len(self.layerwise_swa_sizes) == self.num_layers, (
+            assert len(self.layerwise_swa_sizes) == self.num_hidden_layers, (
                 f"Length of layerwise_swa_sizes ({len(self.layerwise_swa_sizes)}) "
-                f"does not match num_layers ({self.num_layers})"
+                f"does not match num_hidden_layers ({self.num_hidden_layers})"
             )
 
         if self.layerwise_rope_types is not None:
-            assert len(self.layerwise_rope_types) == self.num_layers, (
+            assert len(self.layerwise_rope_types) == self.num_hidden_layers, (
                 f"Length of layerwise_rope_types ({len(self.layerwise_rope_types)}) "
-                f"does not match num_layers ({self.num_layers})"
+                f"does not match num_hidden_layers ({self.num_hidden_layers})"
             )
 
         # Force flash_attention_2 as the only implementation
         self._attn_implementation_internal = "flash_attention_2"  # force flash_attention_2 as the only implementation
-
-
-def scale_query_during_inference(config: HLlamaConfig, query, key):
-    if config.attn_scaling_during_inference_type == "constant":
-        query = query * config.attn_scaling_during_inference_value
-
-    elif config.attn_scaling_during_inference_type == "logn_v1":
-        attention_scale = torch.log(torch.arange(key.shape[0]) + 1) / torch.log(
-            torch.tensor(config.max_sequence_length))
-        attention_scale[0] = 1.0  # prevent zero in scale
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    elif config.attn_scaling_during_inference_type == "logn_v2":
-        attention_scale = (1 + 0.1 * torch.log(
-            (torch.arange(key.shape[0]) + 1) / config.max_sequence_length)) ** 2
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    elif config.attn_scaling_during_inference_type == "logn_v3":
-        attention_scale = torch.log(torch.arange(key.shape[0]) + 1)
-        attention_scale[0] = 1.0  # prevent zero in scale
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    elif config.attn_scaling_during_inference_type == "logn_v4":
-        attention_scale = 0.1 * torch.log((torch.arange(key.shape[0]) + 1))
-        attention_scale[0] = 1.0  # prevent zero in scale
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    elif config.attn_scaling_during_inference_type == "logn_v5":
-        attention_scale = 0.5 * torch.log((torch.arange(key.shape[0]) + 1))
-        attention_scale[0] = 1.0  # prevent zero in scale
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    elif config.attn_scaling_during_inference_type == "logn_v6":
-        attention_scale = 0.5 * math.e * torch.log((torch.arange(key.shape[0]) + 1))
-        attention_scale[0] = 1.0  # prevent zero in scale
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    elif config.attn_scaling_during_inference_type == "logn_v7":
-        logv7_constant = config.attn_scaling_during_inference_value  # just for convenience
-        attention_scale = (torch.log(torch.arange(key.shape[0]) + logv7_constant)) / torch.log(
-            torch.tensor(logv7_constant))
-        attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
-                                                                                 dtype=query.dtype)
-        query = query * attention_scale
-
-    else:
-        raise ValueError(
-            f"Invalid attn_scaling_during_inference_type: {config.attn_scaling_during_inference_type}")
-    return query
 
 
 class HLlamaMLP(nn.Module):
@@ -384,6 +323,7 @@ class HLlamaAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         layer_idx = extract_layer_index(prefix)
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -458,7 +398,7 @@ class HLlamaAttention(nn.Module):
             sliding_window = config.sliding_window
         elif config.layerwise_swa_sizes is not None:
             assert layer_idx < len(config.layerwise_swa_sizes), "Layer index out of bounds for layerwise sliding window"
-            sliding_window = config.layerwise_swa_sizes[layer_idx]
+            sliding_window = config.layerwise_swa_sizes[layer_idx] if config.layerwise_swa_sizes[layer_idx] > 0 else None
 
         if config.layerwise_rope_types is not None:
             assert layer_idx < len(config.layerwise_rope_types), "Layer index out of bounds for layerwise rope types"
@@ -478,6 +418,77 @@ class HLlamaAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings), persistent=False)
+
+
+    def scale_query_during_inference(self, config: HLlamaConfig, query, key):
+        if config.attn_scaling_during_inference_type == "constant":
+            query = query * config.attn_scaling_during_inference_value
+
+        elif config.attn_scaling_during_inference_type == "logn_v1":
+            attention_scale = torch.log(torch.arange(key.shape[0]) + 1) / torch.log(
+                torch.tensor(config.max_sequence_length))
+            attention_scale[0] = 1.0  # prevent zero in scale
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v2":
+            attention_scale = (1 + 0.1 * torch.log(
+                (torch.arange(key.shape[0]) + 1) / config.max_sequence_length)) ** 2
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v3":
+            attention_scale = torch.log(torch.arange(key.shape[0]) + 1)
+            attention_scale[0] = 1.0  # prevent zero in scale
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v4":
+            attention_scale = 0.1 * torch.log((torch.arange(key.shape[0]) + 1))
+            attention_scale[0] = 1.0  # prevent zero in scale
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v5":
+            attention_scale = 0.5 * torch.log((torch.arange(key.shape[0]) + 1))
+            attention_scale[0] = 1.0  # prevent zero in scale
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v6":
+            attention_scale = 0.5 * math.e * torch.log((torch.arange(key.shape[0]) + 1))
+            attention_scale[0] = 1.0  # prevent zero in scale
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v7_old":
+            logv7_constant = config.attn_scaling_during_inference_value  # just for convenience
+            attention_scale = (torch.log(torch.arange(key.shape[0]) + logv7_constant)) / torch.log(torch.tensor(logv7_constant))
+            attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
+                                                                                    dtype=query.dtype)
+            query = query * attention_scale
+
+        elif config.attn_scaling_during_inference_type == "logn_v7":
+            logv7_constant = config.attn_scaling_during_inference_value
+            attention_scale = (torch.log(self.position_ids[:key.shape[0]] + logv7_constant) / torch.log(torch.tensor(logv7_constant)))
+            attention_scale = attention_scale.view(-1, 1)[-query.shape[0]:].to(dtype=query.dtype)
+            # In-place multiplication
+            # query.mul_(attention_scale)
+            query = query * attention_scale
+
+        else:
+            raise ValueError(
+                f"Invalid attn_scaling_during_inference_type: {config.attn_scaling_during_inference_type}")
+        return query
+
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -494,7 +505,7 @@ class HLlamaAttention(nn.Module):
             self.config.attn_scaling_during_inference_type is not None and
             self.config.apply_attention_logn_on_full
         ):
-            q = scale_query_during_inference(self.config, q, k)
+            q = self.scale_query_during_inference(self.config, q, k)
 
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
