@@ -64,6 +64,8 @@ from typing import Optional, List
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig as _LlamaConfig
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 class HLlamaConfig(_LlamaConfig):
     r"""
@@ -418,10 +420,8 @@ class HLlamaAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings), persistent=False)
 
-
-    def scale_query_during_inference(self, config: HLlamaConfig, query, key):
+    def scale_query_during_inference(self, config: HLlamaConfig, query, positions):
         if config.attn_scaling_during_inference_type == "constant":
             query = query * config.attn_scaling_during_inference_value
 
@@ -468,7 +468,7 @@ class HLlamaAttention(nn.Module):
                                                                                     dtype=query.dtype)
             query = query * attention_scale
 
-        elif config.attn_scaling_during_inference_type == "logn_v7_old":
+        elif config.attn_scaling_during_inference_type == "logn_v7_old":   # @kpuvvada to delete.
             logv7_constant = config.attn_scaling_during_inference_value  # just for convenience
             attention_scale = (torch.log(torch.arange(key.shape[0]) + logv7_constant)) / torch.log(torch.tensor(logv7_constant))
             attention_scale = attention_scale[-query.shape[0]:, None, None, None].to(device=query.device,
@@ -477,10 +477,8 @@ class HLlamaAttention(nn.Module):
 
         elif config.attn_scaling_during_inference_type == "logn_v7":
             logv7_constant = config.attn_scaling_during_inference_value
-            attention_scale = (torch.log(self.position_ids[:key.shape[0]] + logv7_constant) / torch.log(torch.tensor(logv7_constant)))
-            attention_scale = attention_scale.view(-1, 1)[-query.shape[0]:].to(dtype=query.dtype)
-            # In-place multiplication
-            # query.mul_(attention_scale)
+            attention_scale = (torch.log(positions + logv7_constant) / torch.log(torch.tensor(logv7_constant)))
+            attention_scale = attention_scale.view(-1, 1).to(dtype=query.dtype)
             query = query * attention_scale
 
         else:
@@ -501,11 +499,14 @@ class HLlamaAttention(nn.Module):
 
         if (
             self.training is False and
-            self.config.sliding_window is None and
+            not self.use_rope and           # don't use self.config.sliding_window  - it is always None in hllama config
             self.config.attn_scaling_during_inference_type is not None and
             self.config.apply_attention_logn_on_full
         ):
-            q = self.scale_query_during_inference(self.config, q, k)
+            # unlike megatron, vllm has "positions" variable which tells us the current position_ids of query
+            # this can be calcualte scaling factors.
+            # Also, at this stage, k here is not yet appended with cache.
+            q = self.scale_query_during_inference(self.config, q, positions)
 
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
