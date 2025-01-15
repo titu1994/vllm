@@ -475,11 +475,18 @@ class HLlamaAttention(nn.Module):
                                                                                     dtype=query.dtype)
             query = query * attention_scale
 
+        elif config.attn_scaling_during_inference_type == "som_logn_v1":
+            logv7_constant = config.attn_scaling_during_inference_value
+            attention_scale = logv7_constant + (positions / positions.max())
+            attention_scale = attention_scale.view(-1, 1).to(dtype=query.dtype)
+            query = query * attention_scale
+
         elif config.attn_scaling_during_inference_type == "logn_v7":
             logv7_constant = config.attn_scaling_during_inference_value
             attention_scale = (torch.log(positions + logv7_constant) / torch.log(torch.tensor(logv7_constant)))
             attention_scale = attention_scale.view(-1, 1).to(dtype=query.dtype)
             query = query * attention_scale
+
 
         else:
             raise ValueError(
